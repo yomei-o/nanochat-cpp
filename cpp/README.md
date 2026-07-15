@@ -69,7 +69,8 @@ Two tokenizers, both dependency-free:
 | `gpt.h` | Model (all ops fwd+bwd), value embeddings, smear, backout, Muon + AdamW |
 | `tokenizer.h` | Character-level tokenizer |
 | `bpe.h` | Self-contained byte-level BPE (train + encode/decode + special tokens) |
-| `main.cpp` | `train` / `sample` driver |
+| `tool.h` | Calculator tool (pure-C++ arithmetic evaluator) for chat tool use |
+| `main.cpp` | `train` / `sample` / `sft` / `chat` driver |
 | `test_grad.cpp` | Gradient check (double precision) |
 | `bpe_test.cpp` | BPE self-test (train on a corpus, verify exact round-trip) |
 | `CMakeLists.txt` | Cross-platform build (auto-detects OpenMP) |
@@ -122,6 +123,45 @@ nanochat train other.txt --init finetune --ckpt ckpt.bin --steps 300 --out ft.bi
 - `--grad-accum N` sums grads over `N` micro-batches per optimizer step
   (effective batch `--batch × N`). On `resume` the LR schedule continues at the
   restored global step.
+
+## Chat: SFT + calculator tool (BPE models)
+
+The port can also turn a base model into a **chat** model and talk to it — fully
+dependency-free. Needs a **BPE** model (the chat/tool special tokens live in the
+tokenizer): `<|bos|>`, `<|user_start|>`/`<|user_end|>`,
+`<|assistant_start|>`/`<|assistant_end|>`, and the tool markers
+`<|python_start|>`/`<|python_end|>`, `<|output_start|>`/`<|output_end|>`.
+
+```bash
+# 1) base-train a BPE model, 2) SFT on a chat corpus, 3) chat with it
+nanochat train corpus.txt --tokenizer bpe --vocab 512 --out base.bin
+nanochat sft chat.txt --ckpt base.bin --steps 200 --out sft.bin
+nanochat chat sft.bin --message "What is 37 + 45?"
+```
+
+- **`sft`** trains on a simple chat corpus — lines `U: ...` / `A: ...`, a blank
+  line ends a conversation — rendered with the special tokens. **Loss is
+  computed only on the assistant tokens** (`target = -1` elsewhere). Assistant
+  text may embed the tool markers literally; they are encoded as their special
+  ids. `--init finetune` (default) starts a fresh optimizer; `resume` continues.
+- **`chat`** renders the conversation, generates the reply with the **KV cache**,
+  streams it, and stops at `<|assistant_end|>`. `--message` does one turn;
+  otherwise it's an interactive REPL. `--temp --topk --max-tokens`.
+- **Calculator tool** (`tool.h`): when the model emits
+  `<|python_start|>EXPR<|python_end|>`, a pure-C++ arithmetic evaluator computes
+  `EXPR` and feeds it back as `<|output_start|>RESULT<|output_end|>`. This is
+  exactly nanochat's "python" tool, which only allows arithmetic (no builtins,
+  no `**`) — so no Python is needed. (True arbitrary-code tools / HumanEval
+  would need a real interpreter and are intentionally out of scope.)
+
+Worked end-to-end here: SFT on synthetic arithmetic Q&A (assistant-only loss
+10.98 → 0.29) taught a 0.9M-param model to call the tool, and the C++ calculator
+answers correctly:
+
+```
+you> What is 37 + 45?
+bot> [calc 37+45 = 82]The answer is 82.
+```
 
 The Muon optimizer + architecture refinements converge markedly faster than
 plain AdamW on the bare architecture. Measured here (4 layers / 96 embd / GQA

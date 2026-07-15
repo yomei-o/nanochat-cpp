@@ -15,6 +15,7 @@
 #include "gpt.h"
 #include "tokenizer.h"
 #include "bpe.h"
+#include "tool.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -24,6 +25,7 @@
 #include <random>
 #include <chrono>
 #include <algorithm>
+#include <iostream>
 using namespace gpt;
 
 // Tokenizer wrapper: char-level (default) or self-trained byte-level BPE, with a
@@ -289,16 +291,202 @@ static int cmd_sample(int argc, char** argv) {
     return 0;
 }
 
+// ===========================================================================
+//  Chat: template rendering, SFT (assistant-only loss), and an interactive CLI
+//  with the calculator tool. Needs a BPE tokenizer (the special tokens live
+//  there). The chat format is:
+//     <|bos|> <|user_start|>..<|user_end|> <|assistant_start|>..<|assistant_end|> ...
+//  SFT computes loss only on assistant content + <|assistant_end|>.
+// ===========================================================================
+// encode text, but recognise literal special-token markers ("<|python_start|>",
+// etc.) and emit their ids instead of BPE-encoding them as characters.
+static std::vector<int> encode_with_specials(const BPE& b, const std::string& text) {
+    std::vector<int> out; size_t i = 0;
+    while (i < text.size()) {
+        if (text[i] == '<' && i + 1 < text.size() && text[i + 1] == '|') {
+            size_t e = text.find("|>", i);
+            if (e != std::string::npos) {
+                std::string tok = text.substr(i, e + 2 - i);
+                int sid = b.special_id(tok);
+                if (sid >= 0) { out.push_back(sid); i = e + 2; continue; }
+            }
+        }
+        size_t next = text.find("<|", i + 1);
+        std::string chunk = text.substr(i, next == std::string::npos ? std::string::npos : next - i);
+        for (int id : b.encode(chunk)) out.push_back(id);
+        i = (next == std::string::npos) ? text.size() : next;
+    }
+    return out;
+}
+
+static void render_turn(const BPE& b, std::vector<int>& ids, std::vector<int>& mask,
+                        const std::string& text, bool assistant) {
+    ids.push_back(b.special_id(assistant ? "<|assistant_start|>" : "<|user_start|>")); mask.push_back(0);
+    for (int id : encode_with_specials(b, text)) { ids.push_back(id); mask.push_back(assistant ? 1 : 0); }
+    ids.push_back(b.special_id(assistant ? "<|assistant_end|>" : "<|user_end|>")); mask.push_back(assistant ? 1 : 0);
+}
+
+// Parse a simple chat corpus: lines "U: ..." / "A: ..."; a blank line ends a
+// conversation. Render everything into one (ids, mask) stream (each convo led
+// by <|bos|>).
+static bool load_chat(const std::string& path, const BPE& b, std::vector<int>& ids, std::vector<int>& mask) {
+    std::ifstream f(path); if (!f) { std::fprintf(stderr, "cannot open %s\n", path.c_str()); return false; }
+    std::string line; bool started = false;
+    auto bos = b.special_id("<|bos|>");
+    while (std::getline(f, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        bool blank = line.find_first_not_of(" \t") == std::string::npos;
+        if (blank) { started = false; continue; }
+        bool asst = (line.size() >= 2 && (line[0] == 'A' || line[0] == 'a') && line[1] == ':');
+        bool user = (line.size() >= 2 && (line[0] == 'U' || line[0] == 'u') && line[1] == ':');
+        if (!asst && !user) continue;
+        std::string text = line.substr(2);
+        size_t s = text.find_first_not_of(" \t"); if (s != std::string::npos) text = text.substr(s);
+        if (!started) { ids.push_back(bos); mask.push_back(0); started = true; }
+        render_turn(b, ids, mask, text, asst);
+    }
+    return !ids.empty();
+}
+
+static int cmd_sft(int argc, char** argv) {
+    std::string input = (argc > 2 && argv[2][0] != '-') ? argv[2] : "chat.txt";
+    std::string ckpt = args(argc, argv, "--ckpt", "");
+    if (ckpt.empty()) { std::fprintf(stderr, "sft needs a base model: --ckpt FILE (a bpe checkpoint)\n"); return 2; }
+    std::string initm = args(argc, argv, "--init", "finetune");   // finetune | resume
+    int steps = argi(argc, argv, "--steps", 400);
+    int B = argi(argc, argv, "--batch", 16);
+    double lr = argf(argc, argv, "--lr", 1.0);
+    int ev = argi(argc, argv, "--eval-every", 50);
+    uint32_t seed = (uint32_t)argi(argc, argv, "--seed", 1337);
+    std::string out = args(argc, argv, "--out", "sft.bin");
+    double grad_clip = argf(argc, argv, "--grad-clip", 0.0);
+    int accum = argi(argc, argv, "--grad-accum", 1); if (accum < 1) accum = 1;
+
+    GPT m; Tok tok; int32_t start_iter = 0;
+    if (!load_ckpt(ckpt, m, tok, &start_iter)) return 1;
+    if (tok.kind != 1) { std::fprintf(stderr, "sft requires a BPE model (train with --tokenizer bpe)\n"); return 1; }
+    if (initm == "finetune") {
+        for (auto* v : m.opt_state_ptrs()) std::fill(v->begin(), v->end(), (real)0);
+        m.m_sl = m.v_sl = m.m_bo = m.v_bo = 0; m.adam_t = 0; start_iter = 0;
+    }
+    int T = m.cfg.sequence_len, V = m.V;
+    std::vector<int> ids, mask;
+    if (!load_chat(input, tok.bpe, ids, mask)) { std::fprintf(stderr, "no chat data in %s (use 'U:'/'A:' lines)\n", input.c_str()); return 1; }
+    std::printf("sft %s: %zu tokens (%d assistant), model %.2fM, block %d\n",
+                initm.c_str(), ids.size(), (int)std::count(mask.begin(), mask.end(), 1), m.num_params()/1e6, T);
+    if ((int)ids.size() < T + 2) { std::fprintf(stderr, "chat data too small for block %d\n", T); return 1; }
+    if (accum > 1) std::printf("grad accumulation: eff batch %d\n", B * accum);
+
+    std::mt19937 rng(seed);
+    std::uniform_int_distribution<int> pick(0, (int)ids.size() - T - 1);
+    std::vector<int> inp(B*T), tgt(B*T);
+    auto fill = [&]() {
+        for (int b = 0; b < B; b++) { int o = pick(rng);
+            for (int t = 0; t < T; t++) { inp[b*T+t] = ids[o+t];
+                tgt[b*T+t] = mask[o+t+1] ? ids[o+t+1] : -1;   // assistant-only loss
+            } }
+    };
+    auto t0 = std::chrono::steady_clock::now();
+    for (int step = 0; step <= steps; step++) {
+        if (step % ev == 0 || step == steps) {
+            double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            std::mt19937 er(step); double s = 0; int it = 5;
+            for (int k = 0; k < it; k++) { fill(); m.forward(inp.data(), tgt.data(), B, T); s += m.mean_loss; }
+            std::printf("step %5d | sft loss %.4f | %.1fs\n", step, s/it, sec); std::fflush(stdout);
+        }
+        if (step == steps) break;
+        m.zero_grad();
+        for (int micro = 0; micro < accum; micro++) { fill(); m.forward(inp.data(), tgt.data(), B, T); m.backward(); }
+        if (accum > 1) m.scale_grads((real)(1.0/accum));
+        if (grad_clip > 0) { real g = m.grad_global_norm(); if (g > grad_clip) m.scale_grads((real)(grad_clip/(g+1e-6))); }
+        int warm = std::max(1, steps/50);
+        double mult = step < warm ? (double)step/warm
+            : 0.1 + 0.9*0.5*(1 + std::cos(3.14159265358979*(double)(step-warm)/std::max(1, steps-warm)));
+        m.optimize((real)(lr * mult));
+    }
+    if (save_ckpt(out, m, tok, 0)) std::printf("saved %s\n", out.c_str());
+    return 0;
+}
+
+// generate an assistant reply into the KV cache, streaming decoded text; runs the
+// calculator tool when the model emits <|python_start|>expr<|python_end|>.
+static int cmd_chat(int argc, char** argv) {
+    std::string ckpt = (argc > 2 && argv[2][0] != '-') ? argv[2] : "sft.bin";
+    double temp = argf(argc, argv, "--temp", 0.7);
+    int topk = argi(argc, argv, "--topk", 40);
+    int maxtok = argi(argc, argv, "--max-tokens", 256);
+    uint32_t seed = (uint32_t)argi(argc, argv, "--seed", 1337);
+    std::string oneshot = args(argc, argv, "--message", "");
+    GPT m; Tok tok;
+    if (!load_ckpt(ckpt, m, tok)) return 1;
+    if (tok.kind != 1) { std::fprintf(stderr, "chat requires a BPE model\n"); return 1; }
+    BPE& b = tok.bpe;
+    int A_end = b.special_id("<|assistant_end|>"), py0 = b.special_id("<|python_start|>");
+    int py1 = b.special_id("<|python_end|>"), o0 = b.special_id("<|output_start|>"), o1 = b.special_id("<|output_end|>");
+    std::mt19937 rng(seed);
+    std::vector<int> convo = { b.special_id("<|bos|>") };
+    std::printf("nanochat (%s). %s\n", tok.kind ? "bpe" : "char",
+                oneshot.empty() ? "Type a message (Ctrl-C to quit)." : "");
+    std::string line; bool interactive = oneshot.empty();
+    for (;;) {
+        std::string user;
+        if (interactive) { std::printf("\nyou> "); std::fflush(stdout); if (!std::getline(std::cin, line)) break; user = line; }
+        else user = oneshot;
+        // build context: convo so far + this user turn + <|assistant_start|>
+        std::vector<int> ctx = convo, mask;
+        render_turn(b, ctx, mask, user, false);
+        ctx.push_back(b.special_id("<|assistant_start|>"));
+        int bs = m.cfg.sequence_len;
+        if ((int)ctx.size() > bs) { std::fprintf(stderr, "\n[context full]\n"); break; }
+        KVCache kv; kv.init(m.L, m.C, m.Ckv, m.cfg.sequence_len);
+        std::vector<real> logits;
+        for (int id : ctx) m.forward_one(id, kv, logits);
+        std::vector<int> reply;
+        std::printf("bot> "); std::fflush(stdout);
+        bool in_tool = false; std::vector<int> tool_expr;
+        for (int step = 0; step < maxtok && kv.pos < bs; step++) {
+            int nx = sample_token(logits, (real)temp, topk, m.V, rng);
+            if (nx == A_end) break;
+            if (nx == py0) { in_tool = true; tool_expr.clear(); m.forward_one(nx, kv, logits); reply.push_back(nx); continue; }
+            if (nx == py1 && in_tool) {   // run the calculator, feed the output back
+                in_tool = false; reply.push_back(nx);
+                std::string expr = b.decode(tool_expr), res;
+                bool ok = eval_calculator(expr, res);
+                std::printf("[calc %s = %s]", expr.c_str(), ok ? res.c_str() : "?"); std::fflush(stdout);
+                std::vector<int> inj = { o0 }; for (int id : b.encode(ok ? res : "?")) inj.push_back(id); inj.push_back(o1);
+                m.forward_one(py1, kv, logits);
+                for (int id : inj) { if (kv.pos >= bs) break; reply.push_back(id); m.forward_one(id, kv, logits); }
+                continue;
+            }
+            reply.push_back(nx);
+            if (in_tool) tool_expr.push_back(nx);
+            else { std::string piece = b.decode({nx}); std::fputs(piece.c_str(), stdout); std::fflush(stdout); }
+            if (kv.pos < bs && step + 1 < maxtok) m.forward_one(nx, kv, logits);
+        }
+        std::printf("\n");
+        // append the assistant turn (incl. markers) to the running conversation
+        convo.insert(convo.end(), ctx.begin() + convo.size(), ctx.end());
+        convo.insert(convo.end(), reply.begin(), reply.end());
+        convo.push_back(A_end);
+        if (!interactive) break;
+    }
+    return 0;
+}
+
 int main(int argc, char** argv) {
     std::string mode = argc > 1 ? argv[1] : "";
     if (mode == "train") return cmd_train(argc, argv);
     if (mode == "sample") return cmd_sample(argc, argv);
+    if (mode == "sft") return cmd_sft(argc, argv);
+    if (mode == "chat") return cmd_chat(argc, argv);
     std::fprintf(stderr,
         "usage:\n"
         "  %s train [input.txt] [--steps N --lr F --batch N --block N --layers N --embd N --heads N --kv-heads N --out FILE\n"
         "                        --init scratch|resume|finetune --ckpt FILE --grad-clip F --grad-accum N\n"
         "                        --tokenizer char|bpe --vocab N]\n"
         "  %s sample [ckpt.bin] [--tokens N --temp F --topk N --prompt STR]\n"
-        "\n(gradient check: build/run the nanochat_gradcheck target)\n", argv[0], argv[0]);
+        "  %s sft chat.txt --ckpt base.bin [--init finetune|resume --steps N --lr F --batch N --out FILE]\n"
+        "  %s chat [sft.bin] [--message STR --temp F --topk N --max-tokens N]   (BPE model; calculator tool)\n"
+        "\n(gradient check: build/run the nanochat_gradcheck target)\n", argv[0], argv[0], argv[0], argv[0]);
     return 2;
 }
