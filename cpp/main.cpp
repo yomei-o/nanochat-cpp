@@ -3,8 +3,12 @@
 //  modern transformer (RoPE, RMSNorm, QK-norm, GQA, ReLU^2, softcap) on CPU.
 //
 //    nanochat train [input.txt] [--steps N --lr F --batch N --block N
-//                    --layers N --embd N --heads N --kv-heads N --out FILE]
+//                    --layers N --embd N --heads N --kv-heads N --out FILE
+//                    --init scratch|resume|finetune --ckpt FILE
+//                    --grad-clip F --grad-accum N]
 //    nanochat sample [ckpt.bin] [--tokens N --temp F --topk N --prompt STR]
+//      resume:   continue training (params + Muon/AdamW state + step)
+//      finetune: keep weights, fresh optimiser + step, train on new data
 //
 //  Gradient check: build/run the nanochat_gradcheck target.
 // ---------------------------------------------------------------------------
@@ -21,14 +25,17 @@
 #include <algorithm>
 using namespace gpt;
 
-static const char MAGIC[4] = {'N', 'C', 'p', '1'};
+//  NCp1 = params only.  NCp2 = params, then AdamW/Muon optimizer state + step,
+//  so training can resume with momentum intact. NCp1 files still load (sample).
+static const char MAGIC1[4] = {'N', 'C', 'p', '1'};
+static const char MAGIC2[4] = {'N', 'C', 'p', '2'};
 
-static bool save_ckpt(const std::string& path, GPT& m, const CharTokenizer& tok) {
+static bool save_ckpt(const std::string& path, GPT& m, const CharTokenizer& tok, int32_t iter = 0) {
     std::ofstream f(path, std::ios::binary);
     if (!f) return false;
     int32_t hdr[7] = {m.cfg.sequence_len, m.cfg.vocab_size, m.cfg.n_layer,
                       m.cfg.n_head, m.cfg.n_kv_head, m.cfg.n_embd, (int32_t)m.cfg.rope_base};
-    f.write(MAGIC, 4); f.write((char*)hdr, sizeof(hdr));
+    f.write(MAGIC2, 4); f.write((char*)hdr, sizeof(hdr));
     int32_t vn = (int32_t)tok.itos.size(); f.write((char*)&vn, 4);
     if (vn) f.write(tok.itos.data(), vn);
     auto wr = [&](std::vector<real>& v) {
@@ -39,13 +46,21 @@ static bool save_ckpt(const std::string& path, GPT& m, const CharTokenizer& tok)
     for (auto& lp : m.layers) { wr(lp.Wq); wr(lp.Wk); wr(lp.Wv); wr(lp.Wo); wr(lp.Wfc); wr(lp.Wproj); if (lp.ve) { wr(lp.ve_emb); wr(lp.ve_gate); } }
     wr(m.resid_l); wr(m.x0_l); wr(m.smear_w);
     float sc[2] = {(float)m.smear_lambda, (float)m.backout_lambda}; f.write((char*)sc, sizeof(sc));
+    // NCp2: optimizer state (step, scalar moments, then all state vectors)
+    int32_t adam_t = m.adam_t; f.write((char*)&adam_t, 4); f.write((char*)&iter, 4);
+    float sm[4] = {(float)m.m_sl, (float)m.v_sl, (float)m.m_bo, (float)m.v_bo};
+    f.write((char*)sm, sizeof(sm));
+    for (auto* v : m.opt_state_ptrs()) wr(*v);
     return (bool)f;
 }
-static bool load_ckpt(const std::string& path, GPT& m, CharTokenizer& tok) {
+// Loads params (NCp1/NCp2). If out_iter != nullptr and the file is NCp2, also
+// restores optimizer momentum and returns the saved step via *out_iter.
+static bool load_ckpt(const std::string& path, GPT& m, CharTokenizer& tok, int32_t* out_iter = nullptr) {
     std::ifstream f(path, std::ios::binary);
     if (!f) { std::fprintf(stderr, "cannot open %s\n", path.c_str()); return false; }
     char mg[4]; int32_t hdr[7]; f.read(mg, 4); f.read((char*)hdr, sizeof(hdr));
-    if (std::memcmp(mg, MAGIC, 4) != 0) { std::fprintf(stderr, "bad ckpt\n"); return false; }
+    bool v2 = std::memcmp(mg, MAGIC2, 4) == 0;
+    if (!v2 && std::memcmp(mg, MAGIC1, 4) != 0) { std::fprintf(stderr, "bad ckpt\n"); return false; }
     GPTConfig c; c.sequence_len = hdr[0]; c.vocab_size = hdr[1]; c.n_layer = hdr[2];
     c.n_head = hdr[3]; c.n_kv_head = hdr[4]; c.n_embd = hdr[5]; c.rope_base = hdr[6];
     int32_t vn; f.read((char*)&vn, 4); std::vector<char> ch(vn); if (vn) f.read(ch.data(), vn);
@@ -59,6 +74,14 @@ static bool load_ckpt(const std::string& path, GPT& m, CharTokenizer& tok) {
     for (auto& lp : m.layers) { rd(lp.Wq); rd(lp.Wk); rd(lp.Wv); rd(lp.Wo); rd(lp.Wfc); rd(lp.Wproj); if (lp.ve) { rd(lp.ve_emb); rd(lp.ve_gate); } }
     rd(m.resid_l); rd(m.x0_l); rd(m.smear_w);
     float sc[2]; f.read((char*)sc, sizeof(sc)); m.smear_lambda = (real)sc[0]; m.backout_lambda = (real)sc[1];
+    if (out_iter) *out_iter = 0;
+    if (v2) {
+        int32_t adam_t = 0, iter = 0; f.read((char*)&adam_t, 4); f.read((char*)&iter, 4);
+        float sm[4]; f.read((char*)sm, sizeof(sm));
+        m.m_sl = (real)sm[0]; m.v_sl = (real)sm[1]; m.m_bo = (real)sm[2]; m.v_bo = (real)sm[3];
+        for (auto* v : m.opt_state_ptrs()) rd(*v);
+        if (f) { m.adam_t = adam_t; if (out_iter) *out_iter = iter; }
+    }
     return (bool)f;
 }
 
@@ -98,6 +121,8 @@ static int argi(int c, char** v, const char* n, int d) { for (int i=1;i<c-1;i++)
 static double argf(int c, char** v, const char* n, double d) { for (int i=1;i<c-1;i++) if(!strcmp(v[i],n)) return atof(v[i+1]); return d; }
 static std::string args(int c, char** v, const char* n, const std::string& d) { for (int i=1;i<c-1;i++) if(!strcmp(v[i],n)) return v[i+1]; return d; }
 
+static bool argflag(int c, char** v, const char* n) { for (int i=1;i<c;i++) if(!strcmp(v[i],n)) return true; return false; }
+
 static int cmd_train(int argc, char** argv) {
     std::string input = (argc > 2 && argv[2][0] != '-') ? argv[2] : "input.txt";
     int steps = argi(argc, argv, "--steps", 2000);
@@ -108,22 +133,44 @@ static int cmd_train(int argc, char** argv) {
     int ev = argi(argc, argv, "--eval-every", 250);
     uint32_t seed = (uint32_t)argi(argc, argv, "--seed", 1337);
     std::string out = args(argc, argv, "--out", "ckpt.bin");
+    double grad_clip = argf(argc, argv, "--grad-clip", 0.0);   // 0 = disabled (nanochat has no default clip)
+    int accum = argi(argc, argv, "--grad-accum", 1); if (accum < 1) accum = 1;
+    std::string init = args(argc, argv, "--init", "scratch");  // scratch | resume | finetune
+    std::string ckpt = args(argc, argv, "--ckpt", "");
+    bool is_resume = (init == "resume"), is_finetune = (init == "finetune");
+    if ((is_resume || is_finetune) && ckpt.empty()) { std::fprintf(stderr, "--init %s requires --ckpt FILE\n", init.c_str()); return 2; }
+    if (init != "scratch" && !is_resume && !is_finetune) { std::fprintf(stderr, "--init must be scratch, resume or finetune\n"); return 2; }
 
     std::ifstream f(input, std::ios::binary);
     if (!f) { std::fprintf(stderr, "cannot open %s\n", input.c_str()); return 1; }
     std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
     std::printf("dataset: %zu chars\n", text.size());
-    CharTokenizer tok; tok.build_from_text(text);
+
+    GPT m; CharTokenizer tok; int32_t start_iter = 0;
+    if (is_resume || is_finetune) {
+        if (!load_ckpt(ckpt, m, tok, &start_iter)) return 1;
+        T = m.cfg.sequence_len;   // model's context length is fixed by the checkpoint
+        std::printf("%s from %s: vocab %d, %.2fM params, saved step %d\n",
+                    init.c_str(), ckpt.c_str(), tok.vocab_size(), m.num_params()/1e6, start_iter);
+        if (is_finetune) {   // keep weights, start a fresh optimiser + step counter
+            for (auto* v : m.opt_state_ptrs()) std::fill(v->begin(), v->end(), (real)0);
+            m.m_sl = m.v_sl = m.m_bo = m.v_bo = 0; m.adam_t = 0; start_iter = 0;
+        }
+    } else {
+        tok.build_from_text(text);
+        GPTConfig c; c.sequence_len = T; c.vocab_size = tok.vocab_size();
+        c.n_layer = nl; c.n_head = nh; c.n_kv_head = nkv; c.n_embd = ne;
+        m.build(c); m.init(seed);
+        std::printf("nanochat-core: %d layers, %d embd, %d/%d heads (GQA), block %d  (%.2fM params)\n",
+                    nl, ne, nh, nkv, T, m.num_params()/1e6);
+    }
     std::printf("vocab: %d\n", tok.vocab_size());
     std::vector<int> data = tok.encode(text);
+    if ((int)data.size() < T + 2) { std::fprintf(stderr, "dataset too small for block %d\n", T); return 1; }
     size_t n = data.size();
     std::vector<int> tr(data.begin(), data.begin() + (size_t)(n*0.9)), va(data.begin()+(size_t)(n*0.9), data.end());
-
-    GPTConfig c; c.sequence_len = T; c.vocab_size = tok.vocab_size();
-    c.n_layer = nl; c.n_head = nh; c.n_kv_head = nkv; c.n_embd = ne;
-    GPT m; m.build(c); m.init(seed);
-    std::printf("nanochat-core: %d layers, %d embd, %d/%d heads (GQA), block %d  (%.2fM params)\n",
-                nl, ne, nh, nkv, T, m.num_params()/1e6);
+    if (accum > 1) std::printf("grad accumulation: %d micro-batches -> effective batch %d\n", accum, B * accum);
+    if (grad_clip > 0) std::printf("grad clip: %.2g\n", grad_clip);
 
     std::mt19937 rng(seed);
     std::uniform_int_distribution<int> pick(0, (int)tr.size() - T - 1);
@@ -134,20 +181,31 @@ static int cmd_train(int argc, char** argv) {
             std::mt19937 er(999);
             double tl = est_loss(m, tr, B, T, 20, er), vl = est_loss(m, va, B, T, 20, er);
             double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-            std::printf("step %5d | train %.4f | val %.4f | %.1fs\n", step, tl, vl, sec);
+            std::printf("step %5d | train %.4f | val %.4f | %.1fs\n", start_iter + step, tl, vl, sec);
             std::fflush(stdout);
         }
         if (step == steps) break;
-        for (int b = 0; b < B; b++) { int o = pick(rng); for (int t = 0; t < T; t++) { inp[b*T+t]=tr[o+t]; tgt[b*T+t]=tr[o+t+1]; } }
-        m.forward(inp.data(), tgt.data(), B, T);
-        m.zero_grad(); m.backward();
+        // gradient accumulation: sum grads over `accum` micro-batches (backward
+        // accumulates into the param grads; activation grads are backward-local).
+        m.zero_grad();
+        for (int micro = 0; micro < accum; micro++) {
+            for (int b = 0; b < B; b++) { int o = pick(rng); for (int t = 0; t < T; t++) { inp[b*T+t]=tr[o+t]; tgt[b*T+t]=tr[o+t+1]; } }
+            m.forward(inp.data(), tgt.data(), B, T);
+            m.backward();
+        }
+        if (accum > 1) m.scale_grads((real)(1.0 / accum));
+        if (grad_clip > 0) {
+            real gnorm = m.grad_global_norm();
+            if (gnorm > grad_clip) m.scale_grads((real)(grad_clip / (gnorm + 1e-6)));
+        }
         // warmup + cosine LR schedule (multiplier on nanochat's per-group base LRs)
-        int warm = std::max(1, steps / 50);
-        double mult = step < warm ? (double)step / warm
-            : 0.1 + 0.9 * 0.5 * (1 + std::cos(3.14159265358979 * (double)(step - warm) / std::max(1, steps - warm)));
+        int gstep = start_iter + step, gtotal = start_iter + steps;
+        int warm = std::max(1, gtotal / 50);
+        double mult = gstep < warm ? (double)gstep / warm
+            : 0.1 + 0.9 * 0.5 * (1 + std::cos(3.14159265358979 * (double)(gstep - warm) / std::max(1, gtotal - warm)));
         m.optimize((real)(lr * mult));
     }
-    if (save_ckpt(out, m, tok)) std::printf("saved %s\n", out.c_str());
+    if (save_ckpt(out, m, tok, start_iter + steps)) std::printf("saved %s (step %d)\n", out.c_str(), start_iter + steps);
     std::mt19937 gr(seed + 1);
     std::vector<int> ctx = {tok.stoi.count('\n') ? tok.stoi.at('\n') : 0};
     std::printf("\n--- sample ---\n%s\n", tok.decode(generate(m, ctx, 300, (real)0.8, 40, gr)).c_str());
@@ -178,7 +236,8 @@ int main(int argc, char** argv) {
     if (mode == "sample") return cmd_sample(argc, argv);
     std::fprintf(stderr,
         "usage:\n"
-        "  %s train [input.txt] [--steps N --lr F --batch N --block N --layers N --embd N --heads N --kv-heads N --out FILE]\n"
+        "  %s train [input.txt] [--steps N --lr F --batch N --block N --layers N --embd N --heads N --kv-heads N --out FILE\n"
+        "                        --init scratch|resume|finetune --ckpt FILE --grad-clip F --grad-accum N]\n"
         "  %s sample [ckpt.bin] [--tokens N --temp F --topk N --prompt STR]\n"
         "\n(gradient check: build/run the nanochat_gradcheck target)\n", argv[0], argv[0]);
     return 2;

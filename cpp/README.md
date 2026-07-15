@@ -80,8 +80,28 @@ nanochat train input.txt --steps 3000 --layers 6 --embd 384 --heads 6 --kv-heads
 nanochat sample ckpt.bin --tokens 500 --temp 0.8 --topk 40 --prompt "ROMEO:"
 ```
 `train` options: `--steps --lr(global LR multiplier) --batch --block --layers
---embd --heads --kv-heads --out --eval-every --seed`. `--heads` must be divisible
-by `--kv-heads` (GQA). Per-group base LRs follow nanochat; `--lr` scales them all.
+--embd --heads --kv-heads --out --eval-every --seed --init --ckpt --grad-clip
+--grad-accum`. `--heads` must be divisible by `--kv-heads` (GQA). Per-group base
+LRs follow nanochat; `--lr` scales them all.
+
+### Resume / fine-tune, grad clip, grad accumulation
+
+```bash
+# resume: continue a run — restores weights, Muon+AdamW momentum and the step.
+nanochat train input.txt --init resume --ckpt ckpt.bin --steps 3000 --out ckpt.bin
+# finetune: keep the weights, fresh optimiser + step counter, new data.
+nanochat train other.txt --init finetune --ckpt ckpt.bin --steps 300 --out ft.bin
+```
+
+- `--init scratch` (default) / `resume` (params **+** optimizer state + step) /
+  `finetune` (params only; optimizer + step reset). Checkpoints are **NCp2**
+  (params + Muon momentum + NorMuon 2nd moments + AdamW moments + step); old
+  **NCp1** files (params only) still load for `sample`.
+- `--grad-clip F` clips gradients to global L2 norm `F` (`0` = off, the default,
+  matching upstream nanochat which doesn't clip).
+- `--grad-accum N` sums grads over `N` micro-batches per optimizer step
+  (effective batch `--batch × N`). On `resume` the LR schedule continues at the
+  restored global step.
 
 The Muon optimizer + architecture refinements converge markedly faster than
 plain AdamW on the bare architecture. Measured here (4 layers / 96 embd / GQA

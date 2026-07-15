@@ -718,6 +718,40 @@ struct GPT {
         const real* l = logits.data() + (size_t)n * V; int best = 0;
         for (int i = 1; i < V; i++) if (l[i] > l[best]) best = i; return best;
     }
+
+    // ---- gradient / optimizer-state access (for grad-clip, accumulation, resume) ----
+    // all gradient *vectors* (the two scalar grads d_smear_lambda/d_backout are
+    // handled separately by grad_global_norm / scale_grads).
+    std::vector<std::vector<real>*> grad_ptrs() {
+        std::vector<std::vector<real>*> p = { &dwte, &dlm, &d_resid, &d_x0, &d_smear_w };
+        for (auto& lp : layers) {
+            p.insert(p.end(), { &lp.dWq, &lp.dWk, &lp.dWv, &lp.dWo, &lp.dWfc, &lp.dWproj });
+            if (lp.ve) p.insert(p.end(), { &lp.dve_emb, &lp.dve_gate });
+        }
+        return p;
+    }
+    // all optimizer-state vectors in a fixed canonical order (Muon momentum +
+    // NorMuon 2nd moment + AdamW moments), for checkpoint save/resume. The four
+    // scalar moments (m_sl/v_sl/m_bo/v_bo) and adam_t are serialized separately.
+    std::vector<std::vector<real>*> opt_state_ptrs() {
+        std::vector<std::vector<real>*> p = { &m_wte, &v_wte, &m_lm, &v_lm, &m_resid,
+                                              &v_resid, &m_x0, &v_x0, &m_sw, &v_sw };
+        for (auto& lp : layers) {
+            p.insert(p.end(), { &lp.bufWq, &lp.bufWk, &lp.bufWv, &lp.bufWo, &lp.bufWfc, &lp.bufWproj,
+                                &lp.b2Wq, &lp.b2Wk, &lp.b2Wv, &lp.b2Wo, &lp.b2Wfc, &lp.b2Wproj });
+            if (lp.ve) p.insert(p.end(), { &lp.m_ve, &lp.v_ve, &lp.m_veg, &lp.v_veg });
+        }
+        return p;
+    }
+    real grad_global_norm() {
+        double s = (double)d_smear_lambda * d_smear_lambda + (double)d_backout * d_backout;
+        for (auto* v : grad_ptrs()) for (real g : *v) s += (double)g * g;
+        return (real)std::sqrt(s);
+    }
+    void scale_grads(real f) {
+        d_smear_lambda *= f; d_backout *= f;
+        for (auto* v : grad_ptrs()) for (real& g : *v) g *= f;
+    }
 };
 
 } // namespace gpt
