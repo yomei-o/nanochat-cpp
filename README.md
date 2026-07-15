@@ -1,7 +1,14 @@
+[English](README.md) | [日本語](README.ja.md)
+
 # nanochat
 
 ![nanochat logo](dev/nanochat.png)
 ![scaling laws](dev/scaling_laws_jan26.png)
+
+> **C++ 移植版について** — このリポジトリには依存ライブラリなしの C++17 移植版
+> ([`cpp/`](cpp/)) が含まれます。モデル・Muon・BPE・KV cache 推論に加え、SFT と
+> 電卓ツール付きの chat まで CPU 上・依存なしで動きます。詳しくは
+> [`cpp/README.md`](cpp/README.md)（[日本語](cpp/README.ja.md)）を参照してください。
 
 nanochat is the simplest experimental harness for training LLMs. It is designed to run on a single GPU node, the code is minimal/hackable, and it covers all major LLM stages including tokenization, pretraining, finetuning, evaluation, and inference. For example, you can train your own GPT-2 capability LLM (which cost ~$43,000 to train in 2019) for only $48 (~2 hours of 8XH100 GPU node) and then talk to it over a simple CLI. On a spot instance, the total cost can be closer to ~$15. More generally, nanochat is configured out of the box to train an entire miniseries of compute-optimal models by setting one single complexity dial: `--depth`, the number of layers in the GPT transformer model (GPT-2 capability happens to be approximately depth 26). All other hyperparameters (the width of the transformer, number of heads, learning rate adjustments, training horizons, weight decays, ...) are calculated automatically in an optimal way.
 

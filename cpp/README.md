@@ -1,3 +1,5 @@
+[English](README.md) | [日本語](README.ja.md)
+
 # nanochat — C++ port
 
 A dependency-free **standard C++17** port of the model + optimizer from Andrej
