@@ -118,24 +118,42 @@ static bool load_ckpt(const std::string& path, GPT& m, Tok& tok, int32_t* out_it
     return (bool)f;
 }
 
+// sample one token id from raw logits with temperature + top-k (in-place scratch).
+static int sample_token(std::vector<real>& l, real temp, int topk, int V, std::mt19937& rng) {
+    std::uniform_real_distribution<double> uni(0, 1);
+    for (auto& x : l) x /= (temp > 0 ? temp : (real)1);
+    if (topk > 0 && topk < V) {
+        std::vector<real> s2(l); std::nth_element(s2.begin(), s2.end() - topk, s2.end());
+        real th = s2[s2.size() - topk]; for (auto& x : l) if (x < th) x = (real)-1e30;
+    }
+    real mx = *std::max_element(l.begin(), l.end());
+    double sum = 0; for (auto& x : l) { x = (real)std::exp((double)(x - mx)); sum += x; }
+    double r = uni(rng) * sum, acc = 0; int nx = V - 1;
+    for (int i = 0; i < V; i++) { acc += l[i]; if (acc >= r) { nx = i; break; } }
+    return nx;
+}
+
+// Generation with a KV cache within the context window (one O(1)-context step
+// per token); falls back to the recompute-with-sliding path beyond it.
 static std::vector<int> generate(GPT& m, std::vector<int> idx, int n, real temp, int topk, std::mt19937& rng) {
     int V = m.V, bs = m.cfg.sequence_len;
-    std::uniform_real_distribution<double> uni(0, 1);
-    for (int s = 0; s < n; s++) {
+    int produced = 0;
+    if ((int)idx.size() <= bs) {
+        KVCache kv; kv.init(m.L, m.C, m.Ckv, m.cfg.sequence_len);
+        std::vector<real> logits;
+        for (size_t i = 0; i < idx.size() && kv.pos < bs; i++) m.forward_one(idx[i], kv, logits);
+        while (produced < n && kv.pos < bs) {
+            int nx = sample_token(logits, temp, topk, V, rng);
+            idx.push_back(nx); produced++;
+            if (kv.pos < bs && produced < n) m.forward_one(nx, kv, logits);
+        }
+    }
+    for (; produced < n; produced++) {   // fallback beyond the context window
         int t = (int)idx.size(), start = std::max(0, t - bs), tc = t - start;
         std::vector<int> cond(idx.begin() + start, idx.end());
         m.forward(cond.data(), nullptr, 1, tc);
         std::vector<real> l(m.logits.begin() + (size_t)(tc - 1) * V, m.logits.begin() + (size_t)tc * V);
-        for (auto& x : l) x /= (temp > 0 ? temp : (real)1);
-        if (topk > 0 && topk < V) {
-            std::vector<real> s2(l); std::nth_element(s2.begin(), s2.end() - topk, s2.end());
-            real th = s2[s2.size() - topk]; for (auto& x : l) if (x < th) x = (real)-1e30;
-        }
-        real mx = *std::max_element(l.begin(), l.end());
-        double sum = 0; for (auto& x : l) { x = (real)std::exp((double)(x - mx)); sum += x; }
-        double r = uni(rng) * sum, acc = 0; int nx = V - 1;
-        for (int i = 0; i < V; i++) { acc += l[i]; if (acc >= r) { nx = i; break; } }
-        idx.push_back(nx);
+        idx.push_back(sample_token(l, temp, topk, V, rng));
     }
     return idx;
 }

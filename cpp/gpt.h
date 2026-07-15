@@ -354,6 +354,23 @@ struct LayerParams {
     std::vector<real> ve_gate, dve_gate, m_veg, v_veg;  // (nkv, 12)
 };
 
+// KV cache for fast autoregressive generation (inference only, batch 1). Stores
+// each layer's QK-normed key and gated value per position (Ckv-wide, shared
+// across GQA query heads), plus the previous token's normed embedding (for the
+// "smear" mix). Valid up to sequence_len positions.
+struct KVCache {
+    int L = 0, C = 0, Ckv = 0, maxT = 0, pos = 0;
+    std::vector<real> k, v;         // each [L][maxT][Ckv]
+    std::vector<real> emb_n_prev;   // (C) previous token's normed embedding
+    bool have_prev = false;
+    void init(int L_, int C_, int Ckv_, int maxT_) {
+        L = L_; C = C_; Ckv = Ckv_; maxT = maxT_; pos = 0; have_prev = false;
+        k.assign((size_t)L * maxT * Ckv, (real)0);
+        v.assign((size_t)L * maxT * Ckv, (real)0);
+        emb_n_prev.assign(C, (real)0);
+    }
+};
+
 struct GPT {
     GPTConfig cfg;
     int C, hd, nh, nkv, Ckv, V, Vp, L, T = 0, B = 0, backout_layer = 0;
@@ -553,6 +570,101 @@ struct GPT {
             for (int i = 0; i < bt; i++) targets[i] = tgt[i];
             mean_loss = softmax_ce(nullptr, probs.data(), logits.data(), targets.data(), bt, V);
         } else mean_loss = -1;
+    }
+
+    // Incremental single-token forward with a KV cache (inference only, B=1).
+    // Mirrors forward() for one token at absolute position kv.pos: appends this
+    // position's QK-normed key and gated value to the cache, attends over the
+    // (possibly windowed) cached range, writes logits (size V), advances kv.pos.
+    // Numerically matches forward() run on the whole prefix. Requires
+    // kv.pos < sequence_len.
+    void forward_one(int token, KVCache& kv, std::vector<real>& logits_out) {
+        int pos = kv.pos, d = hd / 2, group = nh / nkv;
+        real scale = (real)(1.0 / std::sqrt((double)hd));
+        std::vector<real> emb(C), emb_n(C), xs(C), x(C), res_a(C), an(C);
+        std::vector<real> q0(C), k0(Ckv), v0(Ckv), vused(Ckv), q1(C), k1(Ckv), q3(C), k3(Ckv);
+        std::vector<real> yatt(C), yproj(C), mn(C), fc((size_t)4 * C), hg((size_t)4 * C), mproj(C);
+        std::vector<real> x_backout(C, 0), rstd_scratch(std::max(nh, nkv));
+        real rs;
+        // embedding + RMSNorm
+        { const real* w = wte.data() + (size_t)token * C; for (int c = 0; c < C; c++) emb[c] = w[c]; }
+        rmsnorm_fwd(emb_n.data(), &rs, emb.data(), 1, C);
+        // smear: mix the previous token's normed embedding via a learned gate
+        std::copy(emb_n.begin(), emb_n.end(), xs.begin());
+        if (kv.have_prev) {
+            int SM = std::min((int)SMEAR_CH, C);
+            real z = 0; for (int c = 0; c < SM; c++) z += emb_n[c] * smear_w[c];
+            real gate = smear_lambda * sigmoidf(z);
+            for (int c = 0; c < C; c++) xs[c] += gate * kv.emb_n_prev[c];
+        }
+        std::copy(emb_n.begin(), emb_n.end(), kv.emb_n_prev.begin());
+        kv.have_prev = true;
+        std::copy(xs.begin(), xs.end(), x.begin());
+        for (int l = 0; l < L; l++) {
+            LayerParams& lp = layers[l];
+            for (int c = 0; c < C; c++) res_a[c] = resid_l[l] * x[c] + x0_l[l] * xs[c];
+            rmsnorm_fwd(an.data(), &rs, res_a.data(), 1, C);
+            matmul_fwd(q0.data(), an.data(), lp.Wq.data(), 1, C, C);
+            matmul_fwd(k0.data(), an.data(), lp.Wk.data(), 1, C, Ckv);
+            matmul_fwd(v0.data(), an.data(), lp.Wv.data(), 1, C, Ckv);
+            // value embedding + per-head gate (ResFormer), else raw v
+            if (lp.ve) {
+                const real* vemb = lp.ve_emb.data() + (size_t)token * Ckv;
+                int VG = std::min((int)VE_GATE_CH, C);
+                for (int hk = 0; hk < nkv; hk++) {
+                    real z = 0; for (int c = 0; c < VG; c++) z += an[c] * lp.ve_gate[(size_t)hk * VE_GATE_CH + c];
+                    real gate = (real)3 * sigmoidf(z);
+                    for (int i = 0; i < hd; i++) vused[hk * hd + i] = v0[hk * hd + i] + gate * vemb[hk * hd + i];
+                }
+            } else std::copy(v0.begin(), v0.end(), vused.begin());
+            // RoPE at absolute position pos, then per-head QK-norm * 1.2
+            rope_fwd(q1.data(), q0.data(), cos.data() + (size_t)pos * d, sin.data() + (size_t)pos * d, 1, 1, nh, hd);
+            rope_fwd(k1.data(), k0.data(), cos.data() + (size_t)pos * d, sin.data() + (size_t)pos * d, 1, 1, nkv, hd);
+            rmsnorm_fwd(q3.data(), rstd_scratch.data(), q1.data(), nh, hd);
+            rmsnorm_fwd(k3.data(), rstd_scratch.data(), k1.data(), nkv, hd);
+            for (auto& g : q3) g *= (real)1.2;
+            for (auto& g : k3) g *= (real)1.2;
+            // append this position's key/value to the cache
+            std::copy(k3.begin(), k3.end(), kv.k.data() + ((size_t)l * kv.maxT + pos) * Ckv);
+            std::copy(vused.begin(), vused.end(), kv.v.data() + ((size_t)l * kv.maxT + pos) * Ckv);
+            // attention over cached [lo..pos] (sliding window per layer, GQA)
+            int lo = (lp.window > 0 && lp.window < kv.maxT) ? std::max(0, pos - lp.window) : 0;
+            for (int h = 0; h < nh; h++) {
+                int hk = h / group;
+                const real* qv = q3.data() + h * hd;
+                std::vector<real> a(pos + 1);
+                real mx = -1e30f;
+                for (int t2 = lo; t2 <= pos; t2++) {
+                    const real* kk = kv.k.data() + ((size_t)l * kv.maxT + t2) * Ckv + hk * hd;
+                    real dot = 0; for (int i = 0; i < hd; i++) dot += qv[i] * kk[i];
+                    dot *= scale; a[t2] = dot; if (dot > mx) mx = dot;
+                }
+                real sum = 0; for (int t2 = lo; t2 <= pos; t2++) { real e = std::exp(a[t2] - mx); a[t2] = e; sum += e; }
+                real inv = sum > 0 ? (real)1.0 / sum : (real)0;
+                real* o = yatt.data() + h * hd;
+                for (int i = 0; i < hd; i++) o[i] = 0;
+                for (int t2 = lo; t2 <= pos; t2++) {
+                    const real* vv = kv.v.data() + ((size_t)l * kv.maxT + t2) * Ckv + hk * hd;
+                    real aw = a[t2] * inv;
+                    for (int i = 0; i < hd; i++) o[i] += aw * vv[i];
+                }
+            }
+            matmul_fwd(yproj.data(), yatt.data(), lp.Wo.data(), 1, C, C);
+            for (int c = 0; c < C; c++) res_a[c] += yproj[c];       // residual after attn
+            rmsnorm_fwd(mn.data(), &rs, res_a.data(), 1, C);
+            matmul_fwd(fc.data(), mn.data(), lp.Wfc.data(), 1, C, 4 * C);
+            relu2_fwd(hg.data(), fc.data(), 4 * C);
+            matmul_fwd(mproj.data(), hg.data(), lp.Wproj.data(), 1, 4 * C, C);
+            for (int c = 0; c < C; c++) x[c] = res_a[c] + mproj[c];
+            if (l == backout_layer) std::copy(x.begin(), x.end(), x_backout.begin());
+        }
+        std::vector<real> xf(C), xf_n(C), lraw(V);
+        for (int c = 0; c < C; c++) xf[c] = x[c] - backout_lambda * x_backout[c];
+        rmsnorm_fwd(xf_n.data(), &rs, xf.data(), 1, C);
+        matmul_fwd(lraw.data(), xf_n.data(), lm_head.data(), 1, C, V);
+        logits_out.assign(V, (real)0);
+        softcap_fwd(logits_out.data(), lraw.data(), (real)15, V);
+        kv.pos++;
     }
 
     void zero_grad() {
