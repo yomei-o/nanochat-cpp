@@ -167,6 +167,11 @@ you> What is 37 + 45?
 bot> [calc 37+45 = 82]The answer is 82.
 ```
 
+For a full worked example — including **Japanese** input/output and an honest look
+at what a toy-scale model can and can't learn (the tool *format* is trivial; copying
+the *operands* is the hard part) — see
+[`example-japanese-calc.md`](example-japanese-calc.md).
+
 The Muon optimizer + architecture refinements converge markedly faster than
 plain AdamW on the bare architecture. Measured here (4 layers / 96 embd / GQA
 4:2, 4 CPU threads, 300 steps):
