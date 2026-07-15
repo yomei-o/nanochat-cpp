@@ -5,7 +5,7 @@
 //    nanochat train [input.txt] [--steps N --lr F --batch N --block N
 //                    --layers N --embd N --heads N --kv-heads N --out FILE
 //                    --init scratch|resume|finetune --ckpt FILE
-//                    --grad-clip F --grad-accum N]
+//                    --grad-clip F --grad-accum N --tokenizer char|bpe --vocab N]
 //    nanochat sample [ckpt.bin] [--tokens N --temp F --topk N --prompt STR]
 //      resume:   continue training (params + Muon/AdamW state + step)
 //      finetune: keep weights, fresh optimiser + step, train on new data
@@ -14,6 +14,7 @@
 // ---------------------------------------------------------------------------
 #include "gpt.h"
 #include "tokenizer.h"
+#include "bpe.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -25,19 +26,41 @@
 #include <algorithm>
 using namespace gpt;
 
+// Tokenizer wrapper: char-level (default) or self-trained byte-level BPE, with a
+// uniform encode/decode/vocab_size interface used throughout the driver.
+struct Tok {
+    int kind = 0;            // 0 = char, 1 = bpe
+    CharTokenizer ch;
+    BPE bpe;
+    int vocab_size() const { return kind ? bpe.n_vocab() : ch.vocab_size(); }
+    std::vector<int> encode(const std::string& s) const { return kind ? bpe.encode(s) : ch.encode(s); }
+    std::string decode(const std::vector<int>& v) const { return kind ? bpe.decode(v) : ch.decode(v); }
+    int seed_token() const {  // a sensible context seed for empty prompts
+        if (kind) return bpe.bos_id;
+        return ch.stoi.count('\n') ? ch.stoi.at('\n') : 0;
+    }
+};
+
 //  NCp1 = params only.  NCp2 = params, then AdamW/Muon optimizer state + step,
 //  so training can resume with momentum intact. NCp1 files still load (sample).
 static const char MAGIC1[4] = {'N', 'C', 'p', '1'};
 static const char MAGIC2[4] = {'N', 'C', 'p', '2'};
 
-static bool save_ckpt(const std::string& path, GPT& m, const CharTokenizer& tok, int32_t iter = 0) {
+static bool save_ckpt(const std::string& path, GPT& m, const Tok& tok, int32_t iter = 0) {
     std::ofstream f(path, std::ios::binary);
     if (!f) return false;
     int32_t hdr[7] = {m.cfg.sequence_len, m.cfg.vocab_size, m.cfg.n_layer,
                       m.cfg.n_head, m.cfg.n_kv_head, m.cfg.n_embd, (int32_t)m.cfg.rope_base};
     f.write(MAGIC2, 4); f.write((char*)hdr, sizeof(hdr));
-    int32_t vn = (int32_t)tok.itos.size(); f.write((char*)&vn, 4);
-    if (vn) f.write(tok.itos.data(), vn);
+    // tokenizer: kind (0 char, 1 bpe) then its vocab data
+    int32_t kind = tok.kind; f.write((char*)&kind, 4);
+    if (kind == 0) {
+        int32_t vn = (int32_t)tok.ch.itos.size(); f.write((char*)&vn, 4);
+        if (vn) f.write(tok.ch.itos.data(), vn);
+    } else {
+        int32_t nv = (int32_t)tok.bpe.vocab.size(); f.write((char*)&nv, 4);
+        for (auto& v : tok.bpe.vocab) { int32_t l = (int32_t)v.size(); f.write((char*)&l, 4); f.write(v.data(), l); }
+    }
     auto wr = [&](std::vector<real>& v) {
         std::vector<float> b(v.size()); for (size_t i = 0; i < v.size(); i++) b[i] = (float)v[i];
         f.write((char*)b.data(), (std::streamsize)(b.size() * sizeof(float)));
@@ -55,7 +78,7 @@ static bool save_ckpt(const std::string& path, GPT& m, const CharTokenizer& tok,
 }
 // Loads params (NCp1/NCp2). If out_iter != nullptr and the file is NCp2, also
 // restores optimizer momentum and returns the saved step via *out_iter.
-static bool load_ckpt(const std::string& path, GPT& m, CharTokenizer& tok, int32_t* out_iter = nullptr) {
+static bool load_ckpt(const std::string& path, GPT& m, Tok& tok, int32_t* out_iter = nullptr) {
     std::ifstream f(path, std::ios::binary);
     if (!f) { std::fprintf(stderr, "cannot open %s\n", path.c_str()); return false; }
     char mg[4]; int32_t hdr[7]; f.read(mg, 4); f.read((char*)hdr, sizeof(hdr));
@@ -63,8 +86,18 @@ static bool load_ckpt(const std::string& path, GPT& m, CharTokenizer& tok, int32
     if (!v2 && std::memcmp(mg, MAGIC1, 4) != 0) { std::fprintf(stderr, "bad ckpt\n"); return false; }
     GPTConfig c; c.sequence_len = hdr[0]; c.vocab_size = hdr[1]; c.n_layer = hdr[2];
     c.n_head = hdr[3]; c.n_kv_head = hdr[4]; c.n_embd = hdr[5]; c.rope_base = hdr[6];
-    int32_t vn; f.read((char*)&vn, 4); std::vector<char> ch(vn); if (vn) f.read(ch.data(), vn);
-    tok.set_vocab(ch);
+    int32_t kind = 0; f.read((char*)&kind, 4); tok.kind = kind;
+    if (kind == 0) {
+        int32_t vn; f.read((char*)&vn, 4); std::vector<char> ch(vn); if (vn) f.read(ch.data(), vn);
+        tok.ch.set_vocab(ch);
+    } else {
+        int32_t nv = 0; f.read((char*)&nv, 4);
+        tok.bpe.vocab.assign(nv, ""); tok.bpe.ranks.clear();
+        for (int i = 0; i < nv; i++) { int32_t l = 0; f.read((char*)&l, 4); std::string s(l, '\0'); if (l) f.read(&s[0], l); tok.bpe.vocab[i] = s; tok.bpe.ranks[s] = i; }
+        tok.bpe.special.clear();
+        for (int s = 0; s < NANOCHAT_NUM_SPECIAL; s++) tok.bpe.special[NANOCHAT_SPECIALS[s]] = nv + s;
+        tok.bpe.bos_id = tok.bpe.special["<|bos|>"];
+    }
     m.build(c);
     auto rd = [&](std::vector<real>& v) {
         std::vector<float> b(v.size()); f.read((char*)b.data(), (std::streamsize)(b.size() * sizeof(float)));
@@ -137,6 +170,8 @@ static int cmd_train(int argc, char** argv) {
     int accum = argi(argc, argv, "--grad-accum", 1); if (accum < 1) accum = 1;
     std::string init = args(argc, argv, "--init", "scratch");  // scratch | resume | finetune
     std::string ckpt = args(argc, argv, "--ckpt", "");
+    std::string tkkind = args(argc, argv, "--tokenizer", "char");  // char | bpe
+    int bpe_vocab = argi(argc, argv, "--vocab", 2048);             // target BPE vocab (bpe only)
     bool is_resume = (init == "resume"), is_finetune = (init == "finetune");
     if ((is_resume || is_finetune) && ckpt.empty()) { std::fprintf(stderr, "--init %s requires --ckpt FILE\n", init.c_str()); return 2; }
     if (init != "scratch" && !is_resume && !is_finetune) { std::fprintf(stderr, "--init must be scratch, resume or finetune\n"); return 2; }
@@ -146,23 +181,29 @@ static int cmd_train(int argc, char** argv) {
     std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
     std::printf("dataset: %zu chars\n", text.size());
 
-    GPT m; CharTokenizer tok; int32_t start_iter = 0;
+    GPT m; Tok tok; int32_t start_iter = 0;
     if (is_resume || is_finetune) {
         if (!load_ckpt(ckpt, m, tok, &start_iter)) return 1;
         T = m.cfg.sequence_len;   // model's context length is fixed by the checkpoint
-        std::printf("%s from %s: vocab %d, %.2fM params, saved step %d\n",
-                    init.c_str(), ckpt.c_str(), tok.vocab_size(), m.num_params()/1e6, start_iter);
+        std::printf("%s from %s: %s vocab %d, %.2fM params, saved step %d\n",
+                    init.c_str(), ckpt.c_str(), tok.kind ? "bpe" : "char", tok.vocab_size(), m.num_params()/1e6, start_iter);
         if (is_finetune) {   // keep weights, start a fresh optimiser + step counter
             for (auto* v : m.opt_state_ptrs()) std::fill(v->begin(), v->end(), (real)0);
             m.m_sl = m.v_sl = m.m_bo = m.v_bo = 0; m.adam_t = 0; start_iter = 0;
         }
     } else {
-        tok.build_from_text(text);
+        if (tkkind == "bpe") {
+            std::printf("training BPE tokenizer (target vocab %d)...\n", bpe_vocab);
+            tok.kind = 1; tok.bpe.train(text, bpe_vocab);
+            std::printf("  -> %zu BPE tokens + %d special\n", tok.bpe.vocab.size(), NANOCHAT_NUM_SPECIAL);
+        } else {
+            tok.kind = 0; tok.ch.build_from_text(text);
+        }
         GPTConfig c; c.sequence_len = T; c.vocab_size = tok.vocab_size();
         c.n_layer = nl; c.n_head = nh; c.n_kv_head = nkv; c.n_embd = ne;
         m.build(c); m.init(seed);
-        std::printf("nanochat-core: %d layers, %d embd, %d/%d heads (GQA), block %d  (%.2fM params)\n",
-                    nl, ne, nh, nkv, T, m.num_params()/1e6);
+        std::printf("nanochat-core: %d layers, %d embd, %d/%d heads (GQA), block %d, %s vocab %d  (%.2fM params)\n",
+                    nl, ne, nh, nkv, T, tok.kind ? "bpe" : "char", tok.vocab_size(), m.num_params()/1e6);
     }
     std::printf("vocab: %d\n", tok.vocab_size());
     std::vector<int> data = tok.encode(text);
@@ -207,7 +248,7 @@ static int cmd_train(int argc, char** argv) {
     }
     if (save_ckpt(out, m, tok, start_iter + steps)) std::printf("saved %s (step %d)\n", out.c_str(), start_iter + steps);
     std::mt19937 gr(seed + 1);
-    std::vector<int> ctx = {tok.stoi.count('\n') ? tok.stoi.at('\n') : 0};
+    std::vector<int> ctx = {tok.seed_token()};
     std::printf("\n--- sample ---\n%s\n", tok.decode(generate(m, ctx, 300, (real)0.8, 40, gr)).c_str());
     return 0;
 }
@@ -219,12 +260,12 @@ static int cmd_sample(int argc, char** argv) {
     int topk = argi(argc, argv, "--topk", 40);
     uint32_t seed = (uint32_t)argi(argc, argv, "--seed", 1337);
     std::string prompt = args(argc, argv, "--prompt", "");
-    GPT m; CharTokenizer tok;
+    GPT m; Tok tok;
     if (!load_ckpt(ckpt, m, tok)) return 1;
-    std::printf("loaded %s: %d layers, %d embd, %d/%d heads, vocab %d\n",
-                ckpt.c_str(), m.cfg.n_layer, m.cfg.n_embd, m.cfg.n_head, m.cfg.n_kv_head, m.V);
+    std::printf("loaded %s: %d layers, %d embd, %d/%d heads, %s vocab %d\n",
+                ckpt.c_str(), m.cfg.n_layer, m.cfg.n_embd, m.cfg.n_head, m.cfg.n_kv_head, tok.kind ? "bpe" : "char", m.V);
     std::vector<int> ctx = prompt.empty() ? std::vector<int>{} : tok.encode(prompt);
-    if (ctx.empty()) ctx.push_back(tok.stoi.count('\n') ? tok.stoi.at('\n') : 0);
+    if (ctx.empty()) ctx.push_back(tok.seed_token());
     std::mt19937 rng(seed);
     std::printf("%s\n", tok.decode(generate(m, ctx, toks, (real)temp, topk, rng)).c_str());
     return 0;
@@ -237,7 +278,8 @@ int main(int argc, char** argv) {
     std::fprintf(stderr,
         "usage:\n"
         "  %s train [input.txt] [--steps N --lr F --batch N --block N --layers N --embd N --heads N --kv-heads N --out FILE\n"
-        "                        --init scratch|resume|finetune --ckpt FILE --grad-clip F --grad-accum N]\n"
+        "                        --init scratch|resume|finetune --ckpt FILE --grad-clip F --grad-accum N\n"
+        "                        --tokenizer char|bpe --vocab N]\n"
         "  %s sample [ckpt.bin] [--tokens N --temp F --topk N --prompt STR]\n"
         "\n(gradient check: build/run the nanochat_gradcheck target)\n", argv[0], argv[0]);
     return 2;

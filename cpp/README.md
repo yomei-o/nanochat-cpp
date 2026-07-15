@@ -47,10 +47,20 @@ Optimizer (nanochat's `optim.py`) — the **full Muon**:
 
 All forward/backward paths are verified against numerical gradients (below).
 
-## Only remaining substitution
+## Tokenizer
 
-- Tokenizer is char-level (nanochat trains a Rust BPE) — keeps the port fully
-  self-contained. Everything else in `gpt.py` / `optim.py` is implemented.
+Two tokenizers, both dependency-free:
+
+- **char-level** (default) — simplest, fully self-contained.
+- **byte-level BPE** (`--tokenizer bpe`) — a self-contained port of nanochat's
+  tokenizer (nanochat trains a Rust BPE + tiktoken; here we **train our own**
+  byte-level BPE on the corpus in pure C++). Same tiktoken-style greedy merge and
+  GPT-4-ish split pattern, plus nanochat's special tokens (`<|bos|>`,
+  `<|user_start|>`, …, `<|python_start|>`, …). Because training and inference
+  share one pre-tokenizer it is self-consistent (round-trip is exact); it won't
+  match a real tiktoken vocab bit-for-bit, but nanochat trains its own anyway.
+  The trained vocab is baked into the checkpoint. Everything else in `gpt.py` /
+  `optim.py` is implemented.
 
 ## Files
 
@@ -58,8 +68,10 @@ All forward/backward paths are verified against numerical gradients (below).
 |---|---|
 | `gpt.h` | Model (all ops fwd+bwd), value embeddings, smear, backout, Muon + AdamW |
 | `tokenizer.h` | Character-level tokenizer |
+| `bpe.h` | Self-contained byte-level BPE (train + encode/decode + special tokens) |
 | `main.cpp` | `train` / `sample` driver |
 | `test_grad.cpp` | Gradient check (double precision) |
+| `bpe_test.cpp` | BPE self-test (train on a corpus, verify exact round-trip) |
 | `CMakeLists.txt` | Cross-platform build (auto-detects OpenMP) |
 
 ## Build
@@ -81,8 +93,16 @@ nanochat sample ckpt.bin --tokens 500 --temp 0.8 --topk 40 --prompt "ROMEO:"
 ```
 `train` options: `--steps --lr(global LR multiplier) --batch --block --layers
 --embd --heads --kv-heads --out --eval-every --seed --init --ckpt --grad-clip
---grad-accum`. `--heads` must be divisible by `--kv-heads` (GQA). Per-group base
-LRs follow nanochat; `--lr` scales them all.
+--grad-accum --tokenizer --vocab`. `--heads` must be divisible by `--kv-heads`
+(GQA). Per-group base LRs follow nanochat; `--lr` scales them all.
+
+Train with the **BPE** tokenizer (trains it on the corpus first, then bakes it
+into the checkpoint):
+
+```bash
+nanochat train input.txt --tokenizer bpe --vocab 2048 --steps 3000 --layers 6 --embd 384 --out ckpt.bin
+nanochat sample ckpt.bin --prompt "ROMEO:" --tokens 200
+```
 
 ### Resume / fine-tune, grad clip, grad accumulation
 
