@@ -161,6 +161,7 @@ static std::vector<int> generate(GPT& m, std::vector<int> idx, int n, real temp,
 }
 
 static double est_loss(GPT& m, const std::vector<int>& d, int B, int T, int iters, std::mt19937& rng) {
+    if ((int)d.size() < T + 2) return 0;   // split too small for one window (avoids OOB)
     std::uniform_int_distribution<int> pick(0, (int)d.size() - T - 1);
     std::vector<int> inp(B * T), tgt(B * T); double s = 0;
     for (int it = 0; it < iters; it++) {
@@ -227,9 +228,14 @@ static int cmd_train(int argc, char** argv) {
     }
     std::printf("vocab: %d\n", tok.vocab_size());
     std::vector<int> data = tok.encode(text);
-    if ((int)data.size() < T + 2) { std::fprintf(stderr, "dataset too small for block %d\n", T); return 1; }
+    std::printf("encoded %zu tokens\n", data.size());
     size_t n = data.size();
     std::vector<int> tr(data.begin(), data.begin() + (size_t)(n*0.9)), va(data.begin()+(size_t)(n*0.9), data.end());
+    if ((int)tr.size() < T + 2) {   // the 90% train split must hold at least one window
+        std::fprintf(stderr, "dataset too small: %zu train tokens < block %d+2 "
+                     "(use a bigger corpus or a smaller --block)\n", tr.size(), T);
+        return 1;
+    }
     if (accum > 1) std::printf("grad accumulation: %d micro-batches -> effective batch %d\n", accum, B * accum);
     if (grad_clip > 0) std::printf("grad clip: %.2g\n", grad_clip);
 

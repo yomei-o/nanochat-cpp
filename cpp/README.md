@@ -62,7 +62,9 @@ Two tokenizers, both dependency-free:
   share one pre-tokenizer it is self-consistent (round-trip is exact); it won't
   match a real tiktoken vocab bit-for-bit, but nanochat trains its own anyway.
   The trained vocab is baked into the checkpoint. Everything else in `gpt.py` /
-  `optim.py` is implemented.
+  `optim.py` is implemented. Being **byte-level**, it round-trips **any UTF-8**
+  text and trains on non-Latin scripts too — e.g. Japanese works end-to-end
+  (`train … --tokenizer bpe` then `sample`/`chat`), the model is language-agnostic.
 
 ## Files
 
